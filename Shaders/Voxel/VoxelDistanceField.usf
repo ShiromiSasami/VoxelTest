@@ -1,0 +1,148 @@
+// Distance field generation for voxel volume (Density -> Seed -> JFA -> SDF)
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+
+Texture3D<uint>   DensityTex;
+RWTexture3D<float4> SeedUAV;
+int3 VolumeDimensions;
+float VoxelSizeLS;
+
+static const float DENSITY_SCALE = 10000.0;
+static const float ISO_THRESHOLD = 0.5;
+
+float SampleDensity(int3 coord)
+{
+    if (any(coord < int3(0,0,0)) || any(coord >= VolumeDimensions))
+        return 0.0;
+    uint rawDensity = DensityTex[coord];
+    return float(rawDensity) / DENSITY_SCALE;
+}
+
+[numthreads(8,8,8)]
+void SeedCS(uint3 DTid : SV_DispatchThreadID)
+{
+    if (any(DTid >= (uint3)VolumeDimensions)) return;
+
+    const float density = SampleDensity(int3(DTid));
+
+    float4 seed = float4(0,0,0,-1.0);
+    bool isSurface = false;
+
+    float densityPX = SampleDensity(int3(DTid) + int3(1,0,0));
+    float densityNX = SampleDensity(int3(DTid) + int3(-1,0,0));
+    float densityPY = SampleDensity(int3(DTid) + int3(0,1,0));
+    float densityNY = SampleDensity(int3(DTid) + int3(0,-1,0));
+    float densityPZ = SampleDensity(int3(DTid) + int3(0,0,1));
+    float densityNZ = SampleDensity(int3(DTid) + int3(0,0,-1));
+
+    if (density >= ISO_THRESHOLD)
+    {
+        if (densityPX < ISO_THRESHOLD || densityNX < ISO_THRESHOLD ||
+            densityPY < ISO_THRESHOLD || densityNY < ISO_THRESHOLD ||
+            densityPZ < ISO_THRESHOLD || densityNZ < ISO_THRESHOLD)
+        {
+            isSurface = true;
+        }
+    }
+
+    if (isSurface)
+    {
+        float3 grad;
+        grad.x = densityPX - densityNX;
+        grad.y = densityPY - densityNY;
+        grad.z = densityPZ - densityNZ;
+
+        float gradLen = length(grad);
+        float3 seedPos = float3(DTid);
+
+        if (gradLen > 1e-4)
+        {
+            float offset = (ISO_THRESHOLD - density) / gradLen;
+            offset = clamp(offset, -1.0, 1.0);
+            seedPos = float3(DTid) + normalize(grad) * offset;
+        }
+
+        seed.xyz = seedPos;
+        seed.w = 0.0;
+    }
+
+    SeedUAV[DTid] = seed;
+}
+
+Texture3D<float4> InSeed; // RGBA32F
+RWTexture3D<float4> OutSeed;
+int Step;
+
+[numthreads(8,8,8)]
+void JfaCS(uint3 DTid : SV_DispatchThreadID)
+{
+    if (any(DTid >= (uint3)VolumeDimensions)) return;
+
+    float4 best = InSeed[DTid];
+    float3 cellPos = float3(DTid);
+    float  bestDist2 = best.w >= 0.0 ? dot(best.xyz - cellPos, best.xyz - cellPos) : 1e20;
+
+    [unroll] for (int dz = -1; dz <= 1; ++dz)
+    {
+        [unroll] for (int dy = -1; dy <= 1; ++dy)
+        {
+            [unroll] for (int dx = -1; dx <= 1; ++dx)
+            {
+                if (dx == 0 && dy == 0 && dz == 0) continue; // Skip self
+
+                int3 offset = int3(dx, dy, dz) * Step;
+                int3 p = int3(DTid) + offset;
+
+                if (any(p < int3(0,0,0)) || any(p >= VolumeDimensions)) continue;
+
+                float4 s = InSeed[p];
+                if (s.w >= 0.0)
+                {
+                    float d2 = dot(s.xyz - cellPos, s.xyz - cellPos);
+                    if (d2 < bestDist2)
+                    {
+                        best = s;
+                        bestDist2 = d2;
+                    }
+                }
+            }
+        }
+    }
+
+    OutSeed[DTid] = best;
+}
+
+Texture3D<float4> SeedTex;
+RWTexture3D<float> SdfUAV;
+float3 VolumeMinLS;
+
+[numthreads(8,8,8)]
+void DistanceToSdfCS(uint3 DTid : SV_DispatchThreadID)
+{
+    if (any(DTid >= (uint3)VolumeDimensions)) return;
+
+    const float4 s = SeedTex[DTid];
+    const float density = SampleDensity(int3(DTid));
+    const bool isInside = (density >= ISO_THRESHOLD);
+
+    if (s.w < 0.0)
+    {
+        SdfUAV[DTid] = isInside ? -VoxelSizeLS : 1e6;
+        return;
+    }
+
+    const float3 p = VolumeMinLS + (float3(DTid) + 0.5) * VoxelSizeLS;
+    const float3 q = VolumeMinLS + (s.xyz + 0.5) * VoxelSizeLS;
+
+    float dist = length(p - q);
+
+    // Sign convention:
+    // - Negative inside (density >= ISO_THRESHOLD)
+    // - Positive outside (density < ISO_THRESHOLD)
+    if (isInside)
+    {
+        dist = -dist;
+    }
+
+    SdfUAV[DTid] = dist;
+}

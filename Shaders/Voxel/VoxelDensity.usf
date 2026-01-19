@@ -1,0 +1,75 @@
+// Density pass: metaball-style instance splat for organic shapes
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+
+RWTexture3D<uint>  DensityUAV;
+int3 VolumeDimensions;
+uint NumInstances;
+float3 VolumeMinLS;
+float VoxelSizeLS;
+float BaseEdgeLengthLS;
+float OverlapMultiplier;
+StructuredBuffer<float4> InstanceCenters;
+StructuredBuffer<float>  InstanceScales;
+
+static const float DENSITY_SCALE = 10000.0;
+
+float MetaballFalloff(float distSq, float radiusSq)
+{
+    if (distSq >= radiusSq) return 0.0;
+    float t = distSq / radiusSq; // 0 to 1
+    float oneMinusT = 1.0 - t;
+    return oneMinusT * oneMinusT * oneMinusT; // (1-t)^3
+}
+
+[numthreads(64,1,1)]
+void SplatInstancesCS(uint3 Gid : SV_GroupID, uint GIndex : SV_GroupIndex, uint3 DTid : SV_DispatchThreadID)
+{
+    uint idx = DTid.x;
+    if (idx >= NumInstances) return;
+
+    const float3 C = InstanceCenters[idx].xyz;
+    const float  S = InstanceScales[idx];
+    const float3 rel = (C - VolumeMinLS) / max(VoxelSizeLS, 1e-4);
+    const int3   baseCell = int3(floor(rel));
+
+    const float halfEdgeLS = max(BaseEdgeLengthLS * S * 0.5, 0.0);
+    const float baseRadiusCell = halfEdgeLS / max(VoxelSizeLS, 1e-4);
+    const float radiusCell = baseRadiusCell * OverlapMultiplier;
+
+    const float falloffExtend = 1.5;
+    const float searchRadius = radiusCell * falloffExtend;
+    int r = (int)ceil(searchRadius + 0.5);
+    r = clamp(r, 0, 64);
+
+    const float extendedRadiusSq = searchRadius * searchRadius;
+
+    for (int dz = -r; dz <= r; ++dz)
+    {
+        int z = baseCell.z + dz;
+        if (z < 0 || z >= VolumeDimensions.z) continue;
+
+        for (int dy = -r; dy <= r; ++dy)
+        {
+            int y = baseCell.y + dy;
+            if (y < 0 || y >= VolumeDimensions.y) continue;
+
+            for (int dx = -r; dx <= r; ++dx)
+            {
+                int x = baseCell.x + dx;
+                if (x < 0 || x >= VolumeDimensions.x) continue;
+
+                float3 cellCenter = float3(x, y, z) + 0.5;
+                float3 toCell = cellCenter - rel;
+                float distSq = dot(toCell, toCell);
+                float contribution = MetaballFalloff(distSq, extendedRadiusSq);
+
+                if (contribution > 0.0)
+				{
+                    uint densityBits = uint(contribution * DENSITY_SCALE);
+                    InterlockedAdd(DensityUAV[int3(x,y,z)], densityBits);
+                }
+            }
+        }
+    }
+}

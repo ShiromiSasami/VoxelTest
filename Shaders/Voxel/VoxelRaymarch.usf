@@ -1,0 +1,255 @@
+// Raymarch SDF and shade - organic metaball rendering
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+
+Texture3D<float> SDFTex; SamplerState SDFSampler;
+Texture3D<uint>  DensityTex;
+static const float DENSITY_SCALE = 10000.0;
+static const float ISO_THRESHOLD = 0.5;
+
+float3 VolumeMinLS;
+float3 VolumeMaxLS;
+float  VoxelSizeLS;
+float4x4 LocalToWorld;
+float4x4 WorldToLocal;
+float4x4 InvViewProj;
+int3    VolumeDims;
+float3   CameraWorldPos;
+float2   ViewportInvSize;
+float2   ViewportMin;
+
+struct FVSOut { float4 PositionCS : SV_POSITION; };
+
+FVSOut FullscreenVS(uint VertexID : SV_VertexID)
+{
+    const float2 Pos[3] = { float2(-1,-1), float2(-1,3), float2(3,-1) };
+    FVSOut o; o.PositionCS = float4(Pos[VertexID], 0, 1); return o;
+}
+
+bool RayAABB(float3 ro, float3 rd, float3 bmin, float3 bmax, out float t0, out float t1)
+{
+    const float3 dirSign = sign(rd);
+    const float3 invAbs  = rcp(max(abs(rd), 1e-6));
+    const float3 invDir  = dirSign * invAbs;
+
+    const float3 tbot = (bmin - ro) * invDir;
+    const float3 ttop = (bmax - ro) * invDir;
+
+    const float3 tmin3 = min(tbot, ttop);
+    const float3 tmax3 = max(tbot, ttop);
+
+    t0 = max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0));
+    t1 = min(tmax3.x, min(tmax3.y, tmax3.z));
+    return t1 >= t0;
+}
+
+float3 SmoothFrac(float3 f)
+{
+    return f * f * (3.0 - 2.0 * f);
+}
+
+float3 ComputeUVW(float3 pLS, float3 extent)
+{
+    return (pLS - VolumeMinLS) / extent;
+}
+
+float SampleDensity(float3 uvw)
+{
+    float3 edgeDist = min(uvw, 1.0 - uvw);
+    float edgeFalloff = saturate(min(min(edgeDist.x, edgeDist.y), edgeDist.z) * 10.0);
+
+    if (any(uvw < -0.05) || any(uvw > 1.05))
+        return 0.0;
+
+    float3 uvwClamped = clamp(uvw, 0.0, 1.0);
+
+    float3 cellCoord = uvwClamped * float3(VolumeDims) - 0.5;
+    int3 base = int3(floor(cellCoord));
+    float3 f = frac(cellCoord);
+    f = SmoothFrac(f);
+
+    // Clamp to valid range
+    int3 c000 = clamp(base, int3(0,0,0), VolumeDims - int3(1,1,1));
+    int3 c100 = clamp(base + int3(1,0,0), int3(0,0,0), VolumeDims - int3(1,1,1));
+    int3 c010 = clamp(base + int3(0,1,0), int3(0,0,0), VolumeDims - int3(1,1,1));
+    int3 c110 = clamp(base + int3(1,1,0), int3(0,0,0), VolumeDims - int3(1,1,1));
+    int3 c001 = clamp(base + int3(0,0,1), int3(0,0,0), VolumeDims - int3(1,1,1));
+    int3 c101 = clamp(base + int3(1,0,1), int3(0,0,0), VolumeDims - int3(1,1,1));
+    int3 c011 = clamp(base + int3(0,1,1), int3(0,0,0), VolumeDims - int3(1,1,1));
+    int3 c111 = clamp(base + int3(1,1,1), int3(0,0,0), VolumeDims - int3(1,1,1));
+
+    // Sample 8 corners
+    float d000 = float(DensityTex.Load(int4(c000, 0))) / DENSITY_SCALE;
+    float d100 = float(DensityTex.Load(int4(c100, 0))) / DENSITY_SCALE;
+    float d010 = float(DensityTex.Load(int4(c010, 0))) / DENSITY_SCALE;
+    float d110 = float(DensityTex.Load(int4(c110, 0))) / DENSITY_SCALE;
+    float d001 = float(DensityTex.Load(int4(c001, 0))) / DENSITY_SCALE;
+    float d101 = float(DensityTex.Load(int4(c101, 0))) / DENSITY_SCALE;
+    float d011 = float(DensityTex.Load(int4(c011, 0))) / DENSITY_SCALE;
+    float d111 = float(DensityTex.Load(int4(c111, 0))) / DENSITY_SCALE;
+
+    // Smooth trilinear interpolation
+    float d00 = lerp(d000, d100, f.x);
+    float d10 = lerp(d010, d110, f.x);
+    float d01 = lerp(d001, d101, f.x);
+    float d11 = lerp(d011, d111, f.x);
+    float d0 = lerp(d00, d10, f.y);
+    float d1 = lerp(d01, d11, f.y);
+    float density = lerp(d0, d1, f.z);
+
+    return density * edgeFalloff;
+}
+
+float SampleSDF(float3 pLS)
+{
+    float3 extent = max(VolumeMaxLS - VolumeMinLS, 1e-4);
+    float3 uvw = ComputeUVW(pLS, extent);
+
+    if (any(uvw < 0.0) || any(uvw > 1.0))
+    {
+        float3 clamped = clamp(pLS, VolumeMinLS, VolumeMaxLS);
+        return length(pLS - clamped) + VoxelSizeLS;
+    }
+
+    return SDFTex.SampleLevel(SDFSampler, uvw, 0);
+}
+
+// Binary search to refine hit position
+float BinarySearchHit(float3 ro, float3 rd, float tLo, float tHi, int iterations, float threshold)
+{
+    for (int j = 0; j < iterations; ++j)
+    {
+        float tMid = (tLo + tHi) * 0.5;
+        float3 pMid = ro + rd * tMid;
+        float dMid = SampleSDF(pMid);
+        if (dMid < threshold)
+            tHi = tMid;
+        else
+            tLo = tMid;
+    }
+    return (tLo + tHi) * 0.5;
+}
+
+float3 ComputeSimpleLighting(float3 pLS, float3 hitPosW, float3 extent, float3 uvw)
+{
+    float eps = VoxelSizeLS * 0.5;
+    float3 normal;
+    normal.x = SampleDensity(ComputeUVW(pLS + float3(eps,0,0), extent)) -
+               SampleDensity(ComputeUVW(pLS - float3(eps,0,0), extent));
+    normal.y = SampleDensity(ComputeUVW(pLS + float3(0,eps,0), extent)) -
+               SampleDensity(ComputeUVW(pLS - float3(0,eps,0), extent));
+    normal.z = SampleDensity(ComputeUVW(pLS + float3(0,0,eps), extent)) -
+               SampleDensity(ComputeUVW(pLS - float3(0,0,eps), extent));
+
+    float gradLen = length(normal);
+    if (gradLen > 1e-4)
+        normal = normal / gradLen;
+    else
+        normal = float3(0, 1, 0);
+
+    float3 normalWS = normalize(mul(float4(-normal, 0), LocalToWorld).xyz);
+    float3 lightDir = normalize(float3(0.5, 0.8, 0.3));
+    float NdotL = max(dot(normalWS, lightDir), 0.0);
+    float ambient = 0.2;
+    float lighting = ambient + (1.0 - ambient) * NdotL;
+
+    float3 viewDir = normalize(CameraWorldPos - hitPosW);
+    float fresnel = pow(1.0 - max(dot(normalWS, viewDir), 0.0), 3.0);
+    float density = SampleDensity(uvw);
+
+    float3 baseColor = float3(0.9, 0.5, 0.4);
+    baseColor = lerp(baseColor, float3(0.7, 0.3, 0.3), saturate(density - 0.5));
+
+    float3 finalColor = baseColor * lighting + float3(1.0, 0.8, 0.7) * fresnel * 0.4;
+
+    return finalColor;
+}
+
+float4x4 ViewProj;
+
+struct RaymarchOut { float4 Color : SV_Target0; float Depth : SV_Depth; };
+
+RaymarchOut RaymarchPS(FVSOut In)
+{
+    const float3 extent = max(VolumeMaxLS - VolumeMinLS, 1e-4);
+
+    float2 pix = In.PositionCS.xy;
+    float2 uv = (pix - ViewportMin) * ViewportInvSize;
+    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    float4 p4 = mul(float4(ndc, 1, 1), InvViewProj);
+    float3 pW = p4.xyz / max(p4.w, 1e-4);
+    float3 roW = CameraWorldPos;
+    float3 rdW = normalize(pW - roW);
+
+    float3 ro = mul(float4(roW,1), WorldToLocal).xyz;
+    float3 rd = normalize(mul(float4(rdW,0), WorldToLocal).xyz);
+    float tEnter, tExit;
+    if (!RayAABB(ro, rd, VolumeMinLS, VolumeMaxLS, tEnter, tExit))
+    {
+        clip(-1); RaymarchOut o; o.Color = 0; o.Depth = 0; return o;
+    }
+
+    float t = tEnter;
+    const int   MaxSteps   = 192;
+    const float Safety     = 0.5;
+    const float MinStep    = max(0.003 * VoxelSizeLS, 0.0005);
+
+    const float BaseHitEps = VoxelSizeLS * 0.08;
+
+    bool hit = false;
+    float3 pLS = ro + rd * t;
+    float prevD = 1e6;
+    float prevT = t;
+
+    [loop]
+    for (int i = 0; i < MaxSteps; ++i)
+    {
+        if (t > tExit) break;
+
+        pLS = ro + rd * t;
+        float d = SampleSDF(pLS);
+
+        float adaptiveEps = BaseHitEps * (1.0 + 0.001 * t);
+        adaptiveEps = clamp(adaptiveEps, BaseHitEps * 0.5, BaseHitEps * 3.0);
+
+        if (d < adaptiveEps)
+        {
+            t = BinarySearchHit(ro, rd, max(prevT, tEnter), t, 4, adaptiveEps * 0.5);
+            pLS = ro + rd * t;
+            hit = true;
+            break;
+        }
+
+        if (d < 0.0 && prevD > 0.0)
+        {
+            t = BinarySearchHit(ro, rd, prevT, t, 8, 0.0);
+            pLS = ro + rd * t;
+            hit = true;
+            break;
+        }
+
+        if (t > tExit + VoxelSizeLS && d > VoxelSizeLS) break;
+
+        prevD = d;
+        prevT = t;
+
+        float adaptiveSafety = lerp(0.3, Safety, saturate(d / VoxelSizeLS));
+        float stepLen = max(d * adaptiveSafety, MinStep);
+        t += stepLen;
+    }
+
+    if (!hit) { clip(-1); RaymarchOut o; o.Color = 0; o.Depth = 0; return o; }
+
+    float3 hitPosW = mul(float4(pLS,1), LocalToWorld).xyz;
+    float4 clipPos = mul(float4(hitPosW,1), ViewProj);
+    float deviceZ = clipPos.z / max(clipPos.w, 1e-4);
+    deviceZ = saturate(deviceZ);
+
+    float3 uvw = ComputeUVW(pLS, extent);
+    float3 finalColor = ComputeSimpleLighting(pLS, hitPosW, extent, uvw);
+
+    RaymarchOut o;
+    o.Color = float4(finalColor, 1.0);
+    o.Depth = deviceZ;
+    return o;
+}

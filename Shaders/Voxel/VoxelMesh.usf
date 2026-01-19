@@ -1,0 +1,32 @@
+// Voxel shaders (mesh + debug)
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+
+struct FVSInput
+{
+    float3 Position : ATTRIBUTE0;
+};
+
+struct FVSOutput
+{
+    float4 Position : SV_POSITION;
+};
+
+float4x4 LocalToWorld;
+float4x4 WorldToClip;
+
+FVSOutput VoxelMeshVS(FVSInput In)
+{
+    FVSOutput Out;
+    float4 LocalPos = float4(In.Position, 1.0);
+    float3 WorldPos = mul(LocalPos, LocalToWorld).xyz;
+    Out.Position = mul(float4(WorldPos, 1.0), WorldToClip);
+    return Out;
+}
+
+float4 VoxelColor;
+
+float4 VoxelMeshPS(FVSOutput In) : SV_Target0
+{
+    return VoxelColor;
+}
